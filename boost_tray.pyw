@@ -282,47 +282,130 @@ def _softclip(x):
         x[over] = s * (SC_KNEE + _SC_SPAN * np.tanh((ax[over] - SC_KNEE) / _SC_SPAN))
     return x
 
-_cb_count = [0]                       # heartbeat: bumped every callback, healthy or silent
+_cb_count = [0]                       # heartbeat: bumped every output callback
 
-def _audio_cb(indata, outdata, frames, t, status):
-    # Just boost + soft clip — no EQ/de-essing. The soft clipper is transparent
-    # below the knee, so the sound quality is untouched; only peaks are rounded.
+# --- Decoupled capture -> playback through a drift-compensated ring ----------
+# The cable ("CABLE Output") and the speaker run on independent clocks. A single
+# duplex stream serves both from one callback, so when the clocks drift it
+# underruns or overflows — the crackle / "stretch" the user heard. Two separate
+# streams joined by this ring each run on their own clock; playback drops or
+# duplicates ONE sample per callback to hold the buffer near target. That is
+# ~86 samples/s of correction, far more than real clock drift (a few samp/s),
+# and a single duped/dropped sample is inaudible.
+_RING_TARGET = 0.12                    # seconds kept buffered. Big cushion: latency
+                                       # is irrelevant for music, and a stall shorter
+                                       # than this can't drain the ring -> no re-prime
+                                       # gap (the stutter/"لگ"). Lower toward ~0.04 if
+                                       # you need tight A/V lip-sync for video.
+_RING_MAX    = 0.50                    # ring capacity, seconds
+_ring   = [None]                       # np.float32 (N, ch)
+_rlock  = threading.Lock()
+_rw = [0]; _rr = [0]; _rN = [0]; _rfill = [0]; _rtgt = [0]
+_primed = [False]
+
+def _ring_alloc(ch, sr):
+    with _rlock:
+        _rN[0]   = int(sr * _RING_MAX)
+        _ring[0] = np.zeros((_rN[0], ch), dtype=np.float32)
+        _rtgt[0] = int(sr * _RING_TARGET)
+        _rw[0] = _rr[0] = _rfill[0] = 0
+        _primed[0] = False
+
+def _in_cb(indata, frames, t, status):
+    # write capture into the ring; if it's full the clocks drifted, so drop the
+    # oldest audio to catch up (safety net — playback normally holds the level)
+    with _rlock:
+        N = _rN[0]
+        if not N:
+            return
+        over = _rfill[0] + frames - N
+        if over > 0:
+            _rr[0] = (_rr[0] + over) % N
+            _rfill[0] -= over
+        w = _rw[0]; end = w + frames
+        if end <= N:
+            _ring[0][w:end] = indata
+        else:
+            k = N - w
+            _ring[0][w:]     = indata[:k]
+            _ring[0][:end-N] = indata[k:]
+        _rw[0]    = end % N
+        _rfill[0] += frames
+
+def _out_cb(outdata, frames, t, status):
     _cb_count[0] += 1
     with _lock:
         b = _boost
-    np.clip(_softclip(indata * (b * _winvol[0])), -1.0, 1.0, out=outdata)
+    g = b * _winvol[0]
+    with _rlock:
+        N = _rN[0]
+        if not N:
+            outdata.fill(0); return
+        # prime: build a cushion before playing so we don't underrun instantly
+        if not _primed[0]:
+            if _rfill[0] < _rtgt[0]:
+                outdata.fill(0); return
+            _primed[0] = True
+        avail = _rfill[0]
+        # consume frames±1 to nudge the fill level back toward target
+        n = frames
+        if   avail - frames > _rtgt[0] + frames: n = frames + 1   # too full: drop 1
+        elif avail - frames < _rtgt[0] - frames: n = frames - 1   # draining: hold 1
+        if avail < n:
+            n = avail                                             # genuine underrun
+        m = min(n, frames)                                        # samples to copy out
+        r = _rr[0]; end = r + m
+        if end <= N:
+            outdata[:m] = _ring[0][r:end]
+        else:
+            k = N - r
+            outdata[:k]  = _ring[0][r:]
+            outdata[k:m] = _ring[0][:end-N]
+        if m < frames:
+            outdata[m:] = outdata[m-1] if m > 0 else 0            # dup last (stretch) / pad
+        _rr[0]    = (r + n) % N
+        _rfill[0] -= n
+        if _rfill[0] <= 0:
+            _rfill[0] = 0; _primed[0] = False                    # fully drained -> re-prime
+    np.clip(_softclip(outdata * g), -1.0, 1.0, out=outdata)
 
-_stream = None
+_stream  = None                       # OUTPUT stream = health handle for the watcher
+_istream = None
 _cur_out = [None]                     # endpoint FriendlyName the stream renders to
 
 def _close_stream():
-    # abort() force-stops a wedged MME stream that close() alone can leave
-    # running; without it a reopen stacks a second stream and the two overlap
-    # (doubled / garbled audio).
-    global _stream
-    if _stream is not None:
-        try: _stream.abort()
-        except Exception: pass
-        try: _stream.close()
-        except Exception: pass
-        _stream = None
+    # abort() before close() force-stops a wedged MME stream; without it a reopen
+    # can stack a second stream (doubled / garbled audio).
+    global _stream, _istream
+    for s in (_istream, _stream):
+        if s is not None:
+            try: s.abort()
+            except Exception: pass
+            try: s.close()
+            except Exception: pass
+    _stream = _istream = None
 
 def _open_stream(i, o, c):
-    global _stream
+    global _stream, _istream
     _close_stream()
-    # Match the device's actual shared-mode rate (VB-Cable + Realtek are usually
-    # 44100). Hardcoding 48000 forced MME to resample both ends, which drifts and
-    # garbles the audio. Fall back to 48000 only if the query fails.
+    # Native shared-mode rate; both the cable and Realtek are 44100 here, so one
+    # rate serves both with no resampling. Fall back to 48000 if the query fails.
     try:
         sr = int(round(sd.query_devices(i)['default_samplerate'])) or 48000
     except Exception:
         sr = 48000
+    _ring_alloc(c, sr)
     try:
-        _stream = sd.Stream(samplerate=sr, blocksize=1024, device=(i, o),
-                            channels=c, dtype='float32', callback=_audio_cb, latency='high')
-        _stream.start()
+        _istream = sd.InputStream(samplerate=sr, blocksize=512, device=i,
+                                  channels=c, dtype='float32', callback=_in_cb,
+                                  latency='low')
+        _stream  = sd.OutputStream(samplerate=sr, blocksize=512, device=o,
+                                   channels=c, dtype='float32', callback=_out_cb,
+                                   latency=0.08)
+        _istream.start(); _stream.start()
         return True
     except Exception:
+        _close_stream()
         return False
 
 def _unmute_endpoint(name):
